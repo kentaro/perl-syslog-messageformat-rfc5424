@@ -1,16 +1,21 @@
 package Syslog::MessageFormat::RFC5424::StructuredData;
 use strict;
 use warnings;
+use Carp qw(croak);
+use String::UTF8;
 use Parse::RecDescent;
 
 use base qw(Syslog::MessageFormat::RFC5424::Base);
 
-our $GRAMMER = <<'GRAMMER';
-structured_data : STRUCTURED_DATA
+our $grammer = <<'GRAMMER';
+structured_data : STRUCTURED_DATA {
+    $return = ref $item[1] eq 'ARRAY' ?
+        +{ map { each %$_ } @{$item[1]} } : $item[1];
+}
 STRUCTURED_DATA : NILVALUE | SD_ELEMENT(s)
 SD_ELEMENT      : '[' SD_ID SD_PARAM(s?) ']' {
     $return = {
-        $item[2] => $item[3],
+        $item[2] => +{ map { each %$_ } @{$item[3]} }
     }
 }
 SD_PARAM        : PARAM_NAME '=' '"' PARAM_VALUE '"' {
@@ -20,12 +25,21 @@ SD_PARAM        : PARAM_NAME '=' '"' PARAM_VALUE '"' {
 }
 SD_ID           : SD_NAME
 PARAM_NAME      : SD_NAME
-PARAM_VALUE     : UTF8_STRING
+PARAM_VALUE     : VALUE_OCTET(s?) {
+    my $string = join '', @{$item[1] || []};
+    if ($string) {
+        Carp::croak('PARAM-VALUE must be utf8 octets')
+            if !String::UTF8::is_utf8($string);
+        $return = $string;
+    }
+    else {
+        $return = $string;
+    }
+}
 
 SD_NAME         : /[\x21\x23-\x3c\x3e-\x5c\x5e-\x7e]+/
-UTF8_STRING     : OCTET(s?)
+VALUE_OCTET     : '\"' | '\\' | '\]' | /[^"]/
 
-OCTET           : /([\x20\x21\x23-\x5c\x5e-\x7e]|\\"|\\|\\])+/
 NILVALUE        : '-'
 GRAMMER
 
@@ -34,25 +48,16 @@ our $parser;
 sub parser {
     return $parser if $parser;
     my $class = shift;
-    $parser = Parse::RecDescent->new($GRAMMER) or die $@;
+    $parser = Parse::RecDescent->new($grammer) or die $@;
 }
 
 sub parse {
     my ($class, $text) = @_;
-    my $result = $class->parser->structured_data($text) || {};
+    my $result = $class->parser->structured_data($text)
+        or croak 'strunctured data: syntax error';
 
-    if ($result && ref $result eq 'ARRAY') {
-        my $result_hash = {};
-        for my $first (@$result) {
-            my $first_key = (keys %$first)[0];
-            my $array = $first->{$first_key};
-            delete $first->{$first_key};
-            for my $second (@$array) {
-                my $second_key = (keys %$second)[0];
-                $result_hash->{$first_key}{$second_key} = $second->{$second_key}[0];
-            }
-        }
-        return $result_hash;
+    if (!ref $result && ref \$result eq 'SCALAR' && $result eq '-') {
+        $result =  undef;
     }
 
     $result;
@@ -65,7 +70,10 @@ sub to_string {
     for my $sd_id (keys %$data) {
         $string .= qq{[$sd_id};
         for my $param_name (keys %{$data->{$sd_id}}) {
-            $string .= qq{ $param_name="$data->{$sd_id}{$param_name}"};
+            my $value = $data->{$sd_id}{$param_name};
+               $value =~ s{((?<!\\)["\]\\](?!["\]\\]))}{\\$1}g;
+
+            $string .= qq{ $param_name="$value"};
         }
         $string .= ']'
     }
